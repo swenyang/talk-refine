@@ -36,26 +36,131 @@ def wait_forever():
         pass
 
 
+def _open_clipboard_with_retry(max_retries=5, delay=0.05):
+    """Open the clipboard with retries (another process may hold it briefly)."""
+    import win32clipboard
+    for i in range(max_retries):
+        try:
+            win32clipboard.OpenClipboard()
+            return
+        except Exception:
+            if i == max_retries - 1:
+                raise
+            time.sleep(delay)
+
+
+def _save_clipboard():
+    """Save clipboard contents using Win32 API. Returns list of (format, data) or None on failure."""
+    try:
+        import win32clipboard
+    except ImportError:
+        return None
+
+    # Formats safe to round-trip (data is bytes/str, not OS handles)
+    SAFE_FORMATS = {
+        win32clipboard.CF_UNICODETEXT,  # Unicode text
+        win32clipboard.CF_TEXT,         # ANSI text
+        win32clipboard.CF_OEMTEXT,      # OEM text
+        win32clipboard.CF_DIB,          # Device-independent bitmap (screenshots)
+        win32clipboard.CF_HDROP,        # File list
+    }
+    # CF_DIBV5 may not be defined in all pywin32 versions
+    CF_DIBV5 = 17
+    SAFE_FORMATS.add(CF_DIBV5)
+
+    saved = []
+    try:
+        _open_clipboard_with_retry()
+    except Exception:
+        logger.debug("Failed to open clipboard for saving")
+        return None
+    try:
+        fmt = 0
+        while True:
+            fmt = win32clipboard.EnumClipboardFormats(fmt)
+            if fmt == 0:
+                break
+            if fmt not in SAFE_FORMATS:
+                # For unknown/private formats, try if data is bytes
+                try:
+                    data = win32clipboard.GetClipboardData(fmt)
+                    if isinstance(data, (bytes, str)):
+                        saved.append((fmt, data))
+                    else:
+                        logger.debug("Skipping clipboard format %d: non-serializable type %s", fmt, type(data).__name__)
+                except Exception as e:
+                    logger.debug("Skipping clipboard format %d: %s", fmt, e)
+                continue
+            try:
+                data = win32clipboard.GetClipboardData(fmt)
+                saved.append((fmt, data))
+            except Exception as e:
+                logger.debug("Skipping clipboard format %d: %s", fmt, e)
+    finally:
+        win32clipboard.CloseClipboard()
+    return saved
+
+
+def _restore_clipboard(saved):
+    """Restore clipboard contents using Win32 API."""
+    import win32clipboard
+
+    try:
+        _open_clipboard_with_retry()
+    except Exception:
+        logger.debug("Failed to open clipboard for restoring")
+        return
+    try:
+        win32clipboard.EmptyClipboard()
+        for fmt, data in saved:
+            try:
+                win32clipboard.SetClipboardData(fmt, data)
+            except Exception as e:
+                logger.debug("Failed to restore clipboard format %d: %s", fmt, e)
+    finally:
+        win32clipboard.CloseClipboard()
+
+
 def paste_text(text: str, preserve_clipboard: bool = True):
     """Paste text at current cursor position."""
-    import pyperclip
     import pyautogui
 
-    old_clipboard = None
+    saved_clipboard = None
     if preserve_clipboard:
-        try:
-            old_clipboard = pyperclip.paste()
-        except Exception:
-            pass
+        saved_clipboard = _save_clipboard()
+        if saved_clipboard is None:
+            # win32clipboard unavailable, fall back to pyperclip text-only
+            try:
+                import pyperclip
+                saved_clipboard = pyperclip.paste()
+            except Exception:
+                saved_clipboard = None
 
-    pyperclip.copy(text)
+    # Set text to clipboard
+    try:
+        import win32clipboard
+        _open_clipboard_with_retry()
+        try:
+            win32clipboard.EmptyClipboard()
+            win32clipboard.SetClipboardData(win32clipboard.CF_UNICODETEXT, text)
+        finally:
+            win32clipboard.CloseClipboard()
+    except ImportError:
+        import pyperclip
+        pyperclip.copy(text)
+
     time.sleep(0.15)
     pyautogui.hotkey("ctrl", "v")
     time.sleep(0.15)
 
-    if preserve_clipboard and old_clipboard is not None:
+    if preserve_clipboard and saved_clipboard is not None:
         try:
-            pyperclip.copy(old_clipboard)
+            if isinstance(saved_clipboard, list):
+                _restore_clipboard(saved_clipboard)
+            elif isinstance(saved_clipboard, str):
+                # pyperclip fallback: text-only restore
+                import pyperclip
+                pyperclip.copy(saved_clipboard)
         except Exception:
             pass
 
